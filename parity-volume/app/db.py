@@ -35,6 +35,7 @@ CREATE TABLE IF NOT EXISTS stripes (
     d1_disk      INTEGER NOT NULL,
     p_disk       INTEGER NOT NULL,
     healthy      INTEGER NOT NULL DEFAULT 0,
+    compacted    INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (file_id, stripe_index),
     FOREIGN KEY (file_id) REFERENCES files(id)
 );
@@ -85,6 +86,17 @@ class Database:
         self.conn.execute("PRAGMA foreign_keys=ON")
         with self._lock, self.conn:
             self.conn.executescript(SCHEMA)
+            # Databases created before the compaction feature lack the
+            # column; add it in place (existing stripes are uncompacted).
+            cols = {
+                row["name"]
+                for row in self.conn.execute("PRAGMA table_info(stripes)")
+            }
+            if "compacted" not in cols:
+                self.conn.execute(
+                    "ALTER TABLE stripes ADD COLUMN compacted "
+                    "INTEGER NOT NULL DEFAULT 0"
+                )
             now = time.time()
             for i in range(3):
                 self.conn.execute(
@@ -206,6 +218,14 @@ class Database:
             self.conn.execute(
                 "UPDATE stripes SET healthy=? WHERE file_id=? AND stripe_index=?",
                 (1 if healthy else 0, file_id, stripe_index),
+            )
+
+    def set_stripe_compacted(self, file_id: str, stripe_index: int,
+                             compacted: bool) -> None:
+        with self._lock, self.conn:
+            self.conn.execute(
+                "UPDATE stripes SET compacted=? WHERE file_id=? AND stripe_index=?",
+                (1 if compacted else 0, file_id, stripe_index),
             )
 
     def get_stripe(self, file_id: str, stripe_index: int) -> dict[str, Any] | None:

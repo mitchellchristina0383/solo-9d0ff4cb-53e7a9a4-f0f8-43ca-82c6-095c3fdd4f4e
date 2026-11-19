@@ -78,7 +78,7 @@
 <body>
 <header>
   <h1>奇偶校验文件卷（3 盘 · 2 数据块 + 1 XOR 校验块）</h1>
-  <p>单盘故障可继续下载；换空盘后后台重建，重建期间可继续上传。条带大小 <span id="chunk-size">-</span></p>
+  <p>单盘故障可继续下载；换空盘后后台重建，重建期间可继续上传。三盘在线时可压实末条带未写满的文件，去掉零填充。条带大小 <span id="chunk-size">-</span></p>
 </header>
 <main>
   <section class="panel">
@@ -197,19 +197,42 @@ async function refresh() {
   }
 
   const {files} = await api("/api/files");
+  const allOnline = st.disks.every((d) => d.state === "online");
   const tbody = $("#files");
   tbody.innerHTML = "";
   $("#files-empty").style.display = files.length ? "none" : "block";
   for (const f of files) {
     const tr = document.createElement("tr");
+    const compactAction = f.compactable
+      ? (allOnline
+        ? `<a href="#" data-compact="${f.id}" data-name="${escapeHtml(f.name)}">压实</a>`
+        : `<span class="muted" title="需三盘全部在线才能压实">压实</span>`)
+      : "";
+    const compactedBadge = f.compacted
+      ? `<span class="muted">已压实·省 ${fmtSize(f.saved_bytes)}</span>`
+      : "";
     tr.innerHTML = `
       <td>${escapeHtml(f.name)}<div class="muted mono">${f.id}</div></td>
       <td>${fmtSize(f.size)}</td>
       <td>${f.stripe_count}</td>
       <td><a href="/api/files/${f.id}">下载</a>
-          <a href="#" data-del="${f.id}" data-name="${escapeHtml(f.name)}">删除</a></td>`;
+          <a href="#" data-del="${f.id}" data-name="${escapeHtml(f.name)}">删除</a>
+          ${compactAction}${compactedBadge}</td>`;
     tbody.appendChild(tr);
   }
+  document.querySelectorAll("[data-compact]").forEach((a) => {
+    a.onclick = async (ev) => {
+      ev.preventDefault();
+      try {
+        const r = await api(`/api/files/${a.dataset.compact}/compact`,
+                            {method: "POST"});
+        toast(r.already
+          ? `${a.dataset.name} 已是压实状态，合计节省 ${fmtSize(r.bytes_saved)}`
+          : `压实完成：${a.dataset.name}，三个块合计节省 ${fmtSize(r.bytes_saved)}`);
+        refresh();
+      } catch (e) { toast(e.message, false); }
+    };
+  });
   document.querySelectorAll("[data-del]").forEach((a) => {
     a.onclick = async (ev) => {
       ev.preventDefault();

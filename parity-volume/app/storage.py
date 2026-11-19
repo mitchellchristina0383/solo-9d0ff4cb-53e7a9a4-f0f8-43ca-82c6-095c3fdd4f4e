@@ -54,6 +54,31 @@ def read_block(root: Path, relpath: str) -> bytes:
         return fh.read()
 
 
+def truncate_block(root: Path, relpath: str, length: int) -> bool:
+    """Shorten a block file to ``length`` bytes, dropping zero padding.
+
+    Idempotent and atomic (the trimmed content goes through
+    :func:`write_block`, i.e. tmp file + fsync + rename), so an interrupted
+    compaction can simply be retried.  Returns True when the file was
+    actually shortened.  Raises :class:`ValueError` if the bytes beyond
+    ``length`` are not all zero — that would be real data, which must never
+    be dropped.
+    """
+    target = Path(root) / relpath
+    with open(target, "rb") as fh:
+        data = fh.read()
+    if len(data) == length:
+        return False
+    if len(data) < length:
+        raise ValueError(
+            f"block {relpath} is {len(data)} bytes, shorter than {length}"
+        )
+    if any(data[length:]):
+        raise ValueError(f"block {relpath} has non-zero bytes beyond {length}")
+    write_block(root, relpath, data[:length])
+    return True
+
+
 def block_exists(root: Path, relpath: str) -> bool:
     return (Path(root) / relpath).is_file()
 

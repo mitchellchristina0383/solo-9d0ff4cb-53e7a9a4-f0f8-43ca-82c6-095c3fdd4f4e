@@ -29,6 +29,10 @@ logger = logging.getLogger("parity_volume")
 # restart scenarios can reliably interrupt an in-progress rebuild.
 _REBUILD_STRIPE_DELAY = float(os.environ.get("PV_TEST_REBUILD_DELAY", "0"))
 
+# Test-only delay (seconds) applied after each trimmed block so tests can
+# interrupt a compaction mid-stripe.
+_COMPACT_BLOCK_DELAY = float(os.environ.get("PV_TEST_COMPACT_DELAY", "0"))
+
 
 class DiskUnavailableError(Exception):
     """Raised when an operation needs a disk that is offline/missing."""
@@ -36,6 +40,10 @@ class DiskUnavailableError(Exception):
 
 class UnrecoverableError(Exception):
     """Raised when more than one disk is missing for needed data."""
+
+
+class NotCompactableError(Exception):
+    """Raised when a file has no partial last stripe to compact."""
 
 
 class Volume:
@@ -47,6 +55,9 @@ class Volume:
         self.roots = [storage.disk_root(self.base_dir, i) for i in range(coding.DISK_COUNT)]
         self._rebuild_thread: threading.Thread | None = None
         self._stop_event = threading.Event()
+        # Serialises compactions so two concurrent requests cannot trim the
+        # same stripe; downloads deliberately do NOT take this lock.
+        self._compact_lock = threading.Lock()
 
     # ------------------------------------------------------------------ #
     # Lifecycle
@@ -279,7 +290,25 @@ class Volume:
     # Download
     # ------------------------------------------------------------------ #
     def list_files(self) -> list[dict[str, Any]]:
-        return self.db.list_files()
+        files = self.db.list_files()
+        for meta in files:
+            # Compaction view for the operator page: only the last stripe of
+            # a file can be partial, hence only it can be compacted.
+            meta["compactable"] = False
+            meta["compacted"] = False
+            meta["saved_bytes"] = 0
+            stripes = self.db.get_stripes(meta["id"])
+            if stripes:
+                last = stripes[-1]
+                if last["length"] < self.chunk_size:
+                    if last["compacted"]:
+                        meta["compacted"] = True
+                        meta["saved_bytes"] = (
+                            (self.chunk_size - last["length"]) * coding.DISK_COUNT
+                        )
+                    else:
+                        meta["compactable"] = True
+        return files
 
     def delete_file(self, file_id: str) -> bool:
         """Delete a file and all of its blocks. Returns False if unknown."""
@@ -340,6 +369,14 @@ class Volume:
                 f"stripe {file_id}/{stripe['stripe_index']} has only "
                 f"{len(available)} readable block(s); more than one disk failed"
             )
+        # A stripe being compacted may temporarily have blocks of different
+        # on-disk lengths (full chunk vs. trimmed).  Zero-extend shorter
+        # blocks: the trimmed tail was zero padding, so this restores the
+        # original bytes exactly and keeps the parity invariant intact.
+        target = max(len(b) for b in available.values())
+        for role, data in available.items():
+            if len(data) < target:
+                available[role] = data + b"\x00" * (target - len(data))
         if len(available) == 3:
             check = coding.xor_bytes(
                 coding.xor_bytes(available["d0"], available["d1"]),
@@ -361,6 +398,83 @@ class Volume:
         return available["d0"]
 
     # ------------------------------------------------------------------ #
+    # Compaction
+    # ------------------------------------------------------------------ #
+    def compact_file(self, file_id: str) -> dict[str, Any]:
+        """Trim the zero padding of a file's partial last stripe.
+
+        All three block files of the stripe are shortened from
+        ``chunk_size`` to the stripe's valid length; only once every block
+        is trimmed is the stripe flagged ``compacted``.  Each truncation is
+        atomic and idempotent, so an interrupted compaction leaves a fully
+        readable stripe (readers zero-extend trimmed blocks) and can simply
+        be retried.  Requires all three disks online.
+        """
+        meta = self.db.get_file(file_id)
+        if meta is None or meta["status"] != "confirmed":
+            raise FileNotFoundError(file_id)
+        self._reconcile_disk_presence()
+        states = [self.db.disk_state(i) for i in range(coding.DISK_COUNT)]
+        if any(state != "online" for state in states):
+            raise DiskUnavailableError(
+                "compaction requires all three disks to be online"
+            )
+        if self.db.running_rebuild_job() is not None:
+            raise DiskUnavailableError("a rebuild is already in progress")
+        stripes = self.db.get_stripes(file_id)
+        if not stripes:
+            raise NotCompactableError("file has no stripes to compact")
+        last = stripes[-1]
+        if last["length"] >= self.chunk_size:
+            raise NotCompactableError("last stripe is already full")
+        saved = (self.chunk_size - last["length"]) * coding.DISK_COUNT
+        result = {
+            "file_id": file_id,
+            "stripe_index": last["stripe_index"],
+            "bytes_saved": saved,
+        }
+        if last["compacted"]:
+            return {**result, "already": True, "compacted": True}
+        with self._compact_lock:
+            # Re-read under the lock: a concurrent compaction of the same
+            # file may have finished while we waited for the lock.
+            last = self.db.get_stripe(file_id, last["stripe_index"])
+            if last["compacted"]:
+                return {**result, "already": True, "compacted": True}
+            idx = last["stripe_index"]
+            for role in coding.ROLES:
+                block = self.db.get_block(file_id, idx, role)
+                if block is None:
+                    raise UnrecoverableError(
+                        f"metadata incomplete for {file_id}: missing {role} "
+                        f"block of stripe {idx}"
+                    )
+                if self.db.disk_state(block["disk_index"]) != "online":
+                    # A disk dropped mid-compaction: stop here.  The stripe
+                    # stays uncompacted and the operation can be retried.
+                    raise DiskUnavailableError(
+                        f"disk{block['disk_index']} went offline during "
+                        f"compaction"
+                    )
+                try:
+                    storage.truncate_block(
+                        self.roots[block["disk_index"]], block["relpath"],
+                        last["length"],
+                    )
+                except FileNotFoundError:
+                    raise UnrecoverableError(
+                        f"block file missing on disk{block['disk_index']} for "
+                        f"stripe {file_id}/{idx}"
+                    ) from None
+                if _COMPACT_BLOCK_DELAY:
+                    time.sleep(_COMPACT_BLOCK_DELAY)
+            # Only once all three blocks are trimmed is the stripe flagged.
+            self.db.set_stripe_compacted(file_id, idx, True)
+        logger.info("compacted %s stripe %d, saved %d bytes",
+                    file_id, idx, saved)
+        return {**result, "already": False, "compacted": True}
+
+    # ------------------------------------------------------------------ #
     # Rebuild
     # ------------------------------------------------------------------ #
     def _rebuild_worker(self, disk_index: int) -> None:
@@ -380,7 +494,8 @@ class Volume:
                 if _REBUILD_STRIPE_DELAY:
                     time.sleep(_REBUILD_STRIPE_DELAY)
                 done += 1
-                bytes_done += self.chunk_size
+                bytes_done += stripe["length"] if stripe["compacted"] \
+                    else self.chunk_size
                 if done % 8 == 0:
                     self.db.rebuild_progress(job_id, done, bytes_done)
             self.db.rebuild_progress(job_id, done, bytes_done)
@@ -433,6 +548,16 @@ class Volume:
                 )
             survivors[role] = storage.read_block(self.roots[other_disk],
                                                  block["relpath"])
+        # A compacted stripe keeps trimmed blocks, so the rebuilt block must
+        # come out at the trimmed length too.  A stripe interrupted
+        # mid-compaction is rebuilt at full chunk size (zero-extension is
+        # lossless) and simply becomes a candidate for compaction again.
+        expected = stripe["length"] if stripe["compacted"] else self.chunk_size
+        for role, data in survivors.items():
+            if len(data) < expected:
+                survivors[role] = data + b"\x00" * (expected - len(data))
+            elif len(data) > expected:
+                survivors[role] = data[:expected]
         rebuilt = coding.rebuild_missing(role_on_disk, survivors)
         relpath = storage.block_relpath(file_id, idx, role_on_disk)
         # The replacement disk was marked rebuilding; it is writable here.

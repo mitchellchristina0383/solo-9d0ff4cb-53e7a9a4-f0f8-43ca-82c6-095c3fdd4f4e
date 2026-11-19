@@ -11,7 +11,12 @@ from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from urllib.parse import quote
 
-from .volume import DiskUnavailableError, UnrecoverableError, Volume
+from .volume import (
+    DiskUnavailableError,
+    NotCompactableError,
+    UnrecoverableError,
+    Volume,
+)
 
 logger = logging.getLogger("parity_volume")
 
@@ -112,6 +117,16 @@ def delete_file(file_id: str):
     if not volume.delete_file(file_id):
         raise HTTPException(status_code=404, detail="file not found")
     return {"deleted": file_id}
+
+
+@app.post("/api/files/{file_id}/compact")
+def compact_file(file_id: str):
+    try:
+        return volume.compact_file(file_id)
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="file not found")
+    except NotCompactableError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
 
 
 @app.post("/api/disks/{disk_index}/offline")
